@@ -261,14 +261,15 @@ class Batch implements BatchInterface
         array $select,
         ?int $limit = null
     ): Generator {
-        $this->logger->debug('getTraversableList.start',
-                             [
-                                 'apiMethod' => $apiMethod,
-                                 'order'     => $order,
-                                 'filter'    => $filter,
-                                 'select'    => $select,
-                                 'limit'     => $limit,
-                             ]
+        $this->logger->debug(
+            'getTraversableList.start',
+            [
+                'apiMethod' => $apiMethod,
+                'order'     => $order,
+                'filter'    => $filter,
+                'select'    => $select,
+                'limit'     => $limit,
+            ]
         );
 
         // strategy.3 — ID filter, batch, no count, order
@@ -382,6 +383,173 @@ class Batch implements BatchInterface
                     'order'  => [],
                     'filter' => $this->updateFilterForBatch($startId, $lastElementIdInPage, $isLastPage, $filter),
                     'select' => $select,
+                    'start'  => -1,
+                ]
+            );
+        }
+        $this->logger->debug(
+            'getTraversableList.commandsRegistered',
+            [
+                'commandsCount' => $this->commands->count(),
+            ]
+        );
+
+        // iterate batch queries, max:  50 results per 50 elements in each result
+        $elementsCounter = 0;
+        foreach ($this->getTraversable(true) as $queryCnt => $queryResultData) {
+            /**
+             * @var $queryResultData ResponseData
+             */
+            $this->logger->debug(
+                'getTraversableList.batchResultItem',
+                [
+                    'batchCommandItemNumber' => $queryCnt,
+                    'nextItem'               => $queryResultData->getPagination()->getNextItem(),
+                    'durationTime'           => $queryResultData->getTime()->getDuration(),
+                ]
+            );
+            // iterate items in batch query result
+            foreach ($queryResultData->getResult()->getResultData() as $cnt => $listElement) {
+                $elementsCounter++;
+                if ($limit !== null && $elementsCounter > $limit) {
+                    return;
+                }
+                yield $listElement;
+            }
+        }
+        $this->logger->debug('getTraversableList.finish');
+    }
+
+    public function getTraversableListEntity(
+        string $apiMethod,
+        string $entity,
+        array $sort,
+        array $filter,
+        ?int $limit = null
+    ): Generator {
+        $this->logger->debug(
+            'getTraversableList.start',
+            [
+                'apiMethod' => $apiMethod,
+                'entity' => $entity,
+                'sort'     => $sort,
+                'filter'    => $filter,
+                'limit'     => $limit,
+            ]
+        );
+
+        // strategy.3 — ID filter, batch, no count, order
+        // — ✅ отключён подсчёт количества элементов в выборке
+        // — ⚠️ ID элементов в выборке возрастает, т.е. была сделана сортировка результатов по ID
+        // — используем batch
+        // — последовательное выполнение запросов
+        //
+        // Задел по оптимизации
+        // — ограниченное использование параллельных запросов
+        //
+        // Запросы отправляются к серверу последовательно с параметром "order": {"ID": "ASC"} (сортировка по возрастанию ID).
+        // Т.к. результаты отсортированы по возрастанию ID, то их можно объеденить в батч-запросы с отключённым подсчётом количества элементов в каждом.
+        //
+        // Порядок формирования фильтра:
+        //
+        // взяли фильтр с «прямой» сортировкой и получили первый ID
+        // взяли фильтр с «обратной» сортировкой и получили последний ID
+        // Т.к. ID монотонно возрастает, то делаем предположение, что все страницы заполнены элементами равномерно, на самом деле там будут «дыры» из-за мастер-мастер репликации и удалённых элементов. т.е. в результирующих выборках не всегда будет ровно 50 элементов.
+        // из готовых фильтров формируем выборки и упаковываем их в батч-команды.
+        // по возможности, батч-запросы выполняются параллельно
+
+        // получили первый id элемента в выборке по фильтру
+        // todo проверили, что это *.list команда
+        // todo проверили, что в селекте есть ID, т.е. разработчик понимает, что ID используется
+        // todo проверили, что сортировка задана как "order": {"ID": "ASC"} т.е. разработчик понимает, что данные придут в таком порядке
+        // todo проверили, что если есть limit, то он >1
+        // todo проверили, что в фильтре нет поля ID, т.к. мы с ним будем работать
+
+
+        $firstResultPage = $this->core->call(
+            $apiMethod,
+            [
+                'entity' => $entity,
+                'sort'     => $sort,
+                'filter'    => $filter,
+                'start'  => 0,
+            ]
+        );
+        $totalElementsCount = $firstResultPage->getResponseData()->getPagination()->getTotal();
+        // filtered elements count less than or equal one result page(50 elements)
+        $elementsCounter = 0;
+        if ($totalElementsCount <= self::MAX_ELEMENTS_IN_PAGE) {
+            foreach ($firstResultPage->getResponseData()->getResult()->getResultData() as $cnt => $listElement) {
+                $elementsCounter++;
+                if ($limit !== null && $elementsCounter > $limit) {
+                    return;
+                }
+                yield $listElement;
+            }
+            $this->logger->debug('getTraversableList.finish');
+
+            return;
+        }
+
+        // filtered elements count more than one result page(50 elements)
+        // return first page
+        $lastElementIdInFirstPage = null;
+        foreach ($firstResultPage->getResponseData()->getResult()->getResultData() as $cnt => $listElement) {
+            $elementsCounter++;
+            $lastElementIdInFirstPage = $listElement['ID'];
+            if ($limit !== null && $elementsCounter > $limit) {
+                return;
+            }
+            yield $listElement;
+        }
+
+        $this->clearCommands();
+        //if (!in_array('ID', $select, true)) {
+        //$select[] = 'ID';
+        //}
+
+        // getLastElementId in filtered result
+        $lastResultPage = $this->core->call(
+            $apiMethod,
+            [
+                //'order'  => $this->getReverseOrder($order),
+                'entity' => $entity,
+                'sort'     => $this->getReverseOrder($sort),
+                'filter'    => $filter,
+                'start'  => 0,
+            ]
+        );
+
+        $lastElementId = (int)$lastResultPage->getResponseData()->getResult()->getResultData()[0]['ID'];
+
+        // register commands with updated filter
+        //more than one page in results -  register list commands
+        $lastElementIdInFirstPage++;
+        for ($startId = $lastElementIdInFirstPage; $startId <= $lastElementId; $startId += self::MAX_ELEMENTS_IN_PAGE) {
+            $this->logger->debug('registerCommand.item', [
+                'startId'       => $startId,
+                'lastElementId' => $lastElementId,
+                'delta'         => $lastElementId - $startId,
+            ]);
+
+            $delta = $lastElementId - $startId;
+            $isLastPage = false;
+            if ($delta > self::MAX_ELEMENTS_IN_PAGE) {
+                // ignore
+                // - master–master replication with id
+                // - deleted elements
+                $lastElementIdInPage = $startId + self::MAX_ELEMENTS_IN_PAGE;
+            } else {
+                $lastElementIdInPage = $lastElementId;
+                $isLastPage = true;
+            }
+
+            $this->registerCommand(
+                $apiMethod,
+                [
+                    'order'  => [],
+                    'filter' => $this->updateFilterForBatch($startId, $lastElementIdInPage, $isLastPage, $filter),
+                    //'select' => $select,
                     'start'  => -1,
                 ]
             );
