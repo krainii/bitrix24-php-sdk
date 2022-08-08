@@ -547,9 +547,9 @@ class Batch implements BatchInterface
             $this->registerCommand(
                 $apiMethod,
                 [
-                    'order'  => [],
+                    'sort'     => $sort,
+                    'entity' => $entity,
                     'filter' => $this->updateFilterForBatch($startId, $lastElementIdInPage, $isLastPage, $filter),
-                    //'select' => $select,
                     'start'  => -1,
                 ]
             );
